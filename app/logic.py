@@ -5,19 +5,24 @@
   BEGIN IMMEDIATE 单事务内完成；SQLite 同时串行化写者。导入与封账重叠时，
   谁先提交谁先进库：批次按提交时的待结月计入本期或下期，失败整体回滚，
   不留部分结果。
+
+金额约定：
+- 单笔仍限 15 位整数分（``money.MAX_AMOUNT_CENTS``），但批合计、期净变动、
+  归档累计都以 Python 任意精度整数计算、以十进制文本入库，因此合计即使超出
+  有符号 64 位也能精确到分。
 """
 import csv
 import io
 import re
 import threading
 
+from .money import (format_cents, format_cents_signed, parse_amount_cents,
+                    to_int, to_text)
 from .months import month_range, next_month, parse_month
 
 WRITE_LOCK = threading.Lock()
 
-MAX_AMOUNT_CENTS = 999_999_999_999_999  # 15 位以内，避免 SUM 溢出 int64
 CLAIM_NO_RE = re.compile(r"^[^\s,]{1,64}$")
-AMOUNT_RE = re.compile(r"^\d{1,15}$")
 
 HEADER_ALIASES = {
     "claim_no": {"claim_no", "claimno", "claim", "claim_id", "赔款号", "赔案号"},
@@ -74,6 +79,25 @@ def set_first_pending(conn, month):
         raise
 
 
+# ---------------------------------------------------------------- 汇总（任意精度）
+
+def claims_summary(conn):
+    """首页「赔款当前合计」：在 Python 整数上求和，不受 int64 限制。"""
+    count = conn.execute("SELECT COUNT(*) AS n FROM claims").fetchone()["n"]
+    return {"n": count, "cents": _sum_column(conn, "claims", "amount_cents")}
+
+
+def archive_net_total(conn, close_month):
+    return _sum_column(conn, "archive", "net_cents", "close_month = ?", (close_month,))
+
+
+def _sum_column(conn, table, column, where="", args=()):
+    sql = f"SELECT {column} AS v FROM {table}"
+    if where:
+        sql += f" WHERE {where}"
+    return sum(to_int(row["v"]) for row in conn.execute(sql, args))
+
+
 # ---------------------------------------------------------------- CSV 解析校验
 
 def parse_csv_text(text, pending):
@@ -88,7 +112,7 @@ def parse_csv_text(text, pending):
         if not raw or all(not c.strip() for c in raw):
             continue
         if header is None:
-            header = [c.strip().lstrip("\ufeff").lower() for c in raw]
+            header = [c.strip().lstrip("﻿").lower() for c in raw]
             col_map = {}
             for idx, name in enumerate(header):
                 field = next((f for f, aliases in HEADER_ALIASES.items() if name in aliases), None)
@@ -122,13 +146,9 @@ def parse_csv_text(text, pending):
         pay = parse_month(rec["payment_month"])
         if pay is None:
             errors.append(f"第 {lineno} 行：支付月格式应为 YYYY-MM：{rec['payment_month']!r}")
-        amt = None
-        if not AMOUNT_RE.match(rec["amount_cents"]):
-            errors.append(f"第 {lineno} 行：金额须为非负整数（分）：{rec['amount_cents']!r}")
-        else:
-            amt = int(rec["amount_cents"])
-            if amt > MAX_AMOUNT_CENTS:
-                errors.append(f"第 {lineno} 行：金额超出上限 {MAX_AMOUNT_CENTS} 分")
+        amt = parse_amount_cents(rec["amount_cents"])
+        if amt is None:
+            errors.append(f"第 {lineno} 行：金额须为非负整数（分，最多 15 位）：{rec['amount_cents']!r}")
         if acc and pay:
             if pay < acc:
                 errors.append(f"第 {lineno} 行：支付月 {pay} 早于事故月 {acc}")
@@ -150,7 +170,10 @@ def parse_csv_text(text, pending):
 
 
 def apply_batch(conn, rows):
-    """整批写入（同号整笔覆盖）。调用方须持有 WRITE_LOCK。失败整体回滚。"""
+    """整批写入（同号整笔覆盖）。调用方须持有 WRITE_LOCK。失败整体回滚。
+
+    批次金额合计在 Python 整数上求和后以文本入库，批次本身一次提交。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
         pend = get_pending(conn)
@@ -162,10 +185,10 @@ def apply_batch(conn, rows):
                 raise BatchError([
                     f"支付月 {r['payment_month']} 晚于当前待结月 {pend}（期间封账已推进，请重新提交）"
                 ])
-        total = sum(r["amount_cents"] for r in rows)
+        total = sum(r["amount_cents"] for r in rows)  # 任意精度，不落 int64
         cur = conn.execute(
             "INSERT INTO batches(period_month, row_count, total_cents, overwritten) VALUES(?,?,?,0)",
-            (pend, len(rows), total),
+            (pend, len(rows), to_text(total)),
         )
         batch_id = cur.lastrowid
         overwritten = 0
@@ -180,19 +203,17 @@ def apply_batch(conn, rows):
                 "   payment_month  = excluded.payment_month,"
                 "   amount_cents   = excluded.amount_cents,"
                 "   batch_id       = excluded.batch_id",
-                (r["claim_no"], r["accident_month"], r["payment_month"], r["amount_cents"], batch_id),
+                (r["claim_no"], r["accident_month"], r["payment_month"],
+                 to_text(r["amount_cents"]), batch_id),
             )
         conn.execute("UPDATE batches SET overwritten = ? WHERE id = ?", (overwritten, batch_id))
         conn.commit()
         return {"batch_id": batch_id, "period_month": pend, "row_count": len(rows),
-                "total_cents": total, "overwritten": overwritten}
+                "total_cents": total, "total_text": format_cents(total),
+                "overwritten": overwritten}
     except Exception:
         conn.rollback()
         raise
-
-
-def rows_iter(rows):
-    return iter(rows)
 
 
 # ---------------------------------------------------------------- 封账
@@ -201,10 +222,11 @@ def _period_deltas(conn, pend):
     """本期（待结月 = pend）各 (事故月, 支付月) 组合的净变动。
 
     对本期批次触及的每笔赔案：减去其归档快照（如有），加上当前值。
-    返回 (触及赔案行, {组合: 净变动})，净变动为 0 的组合已被剔除。
+    全程 Python 任意精度整数求和，正负抵消后精确归零的组合被剔除。
+    返回 (本期批次触及的赔案行, {组合: 净变动})。
     """
     touched = conn.execute(
-        "SELECT c.claim_no, c.accident_month, c.payment_month, c.amount_cents,"
+        "SELECT c.claim_no, c.accident_month, c.payment_month, c.amount_cents AS amount,"
         "       a.accident_month AS p_acc, a.payment_month AS p_pay, a.amount_cents AS p_amt"
         " FROM claims c"
         " JOIN batches b ON b.id = c.batch_id"
@@ -216,9 +238,9 @@ def _period_deltas(conn, pend):
     for t in touched:
         if t["p_amt"] is not None:
             key = (t["p_acc"], t["p_pay"])
-            deltas[key] = deltas.get(key, 0) - t["p_amt"]
+            deltas[key] = deltas.get(key, 0) - to_int(t["p_amt"])
         key = (t["accident_month"], t["payment_month"])
-        deltas[key] = deltas.get(key, 0) + t["amount_cents"]
+        deltas[key] = deltas.get(key, 0) + to_int(t["amount"])
     return touched, {k: v for k, v in deltas.items() if v != 0}
 
 
@@ -227,12 +249,15 @@ def close_preview(conn, pend):
     batch_count = conn.execute(
         "SELECT COUNT(*) AS c FROM batches WHERE period_month = ?", (pend,)
     ).fetchone()["c"]
-    items = [(acc, pay, f"{net:+,}") for (acc, pay), net in sorted(deltas.items())]
+    items = [(acc, pay, format_cents_signed(net)) for (acc, pay), net in sorted(deltas.items())]
     return {"batch_count": batch_count, "claim_count": len(touched), "combos": items}
 
 
 def close_pending(conn, month):
-    """封当前待结月并推进到次月。调用方须持有 WRITE_LOCK。失败整体回滚。"""
+    """封当前待结月并推进到次月。调用方须持有 WRITE_LOCK。失败整体回滚。
+
+    归档行与待结月推进在同一事务内一次提交；失败则数据与待结月都保持操作前状态。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
         pend = get_pending(conn)
@@ -245,7 +270,7 @@ def close_pending(conn, month):
             conn.execute(
                 "INSERT INTO archive(close_month, accident_month, payment_month, net_cents)"
                 " VALUES(?,?,?,?)",
-                (pend, acc, pay, net),
+                (pend, acc, pay, to_text(net)),
             )
         for t in touched:
             conn.execute(
@@ -255,7 +280,7 @@ def close_pending(conn, month):
                 "   accident_month = excluded.accident_month,"
                 "   payment_month  = excluded.payment_month,"
                 "   amount_cents   = excluded.amount_cents",
-                (t["claim_no"], t["accident_month"], t["payment_month"], t["amount_cents"]),
+                (t["claim_no"], t["accident_month"], t["payment_month"], t["amount"]),
             )
         batch_count = conn.execute(
             "SELECT COUNT(*) AS c FROM batches WHERE period_month = ?", (pend,)
@@ -281,11 +306,35 @@ def closed_months(conn):
 
 
 def archive_detail(conn, close_month):
-    return conn.execute(
+    """归档明细：按组合逐行返回，金额转成整数（任意精度）便于模板格式化。"""
+    rows = []
+    for r in conn.execute(
         "SELECT accident_month, payment_month, net_cents FROM archive"
         " WHERE close_month = ? ORDER BY accident_month, payment_month",
         (close_month,),
-    ).fetchall()
+    ):
+        rows.append({"accident_month": r["accident_month"],
+                     "payment_month": r["payment_month"],
+                     "net_cents": to_int(r["net_cents"])})
+    return rows
+
+
+def _archived_cells(conn, start, close_month):
+    """把 ``close_month <= 所选已结月`` 的归档汇总按 (事故月, 支付月) 聚合。
+
+    逐行迭代游标并在 Python 整数上累加，只保留「组合 -> 累计」字典：
+    内存 O(组合数)，不随单个组合的归档行数增长（同一组合的期数再多也只占一条）。
+    """
+    cells = {}
+    rows = conn.execute(
+        "SELECT accident_month, payment_month, net_cents FROM archive"
+        " WHERE close_month <= ? AND accident_month >= ? AND accident_month <= ?",
+        (close_month, start, close_month),
+    )
+    for r in rows:
+        key = (r["accident_month"], r["payment_month"])
+        cells[key] = cells.get(key, 0) + to_int(r["net_cents"])
+    return cells
 
 
 def build_triangle(conn, start, close_month):
@@ -294,15 +343,12 @@ def build_triangle(conn, start, close_month):
     行：起始事故月 start 至 close_month 的每个事故月；
     列：start 至最新已结月。每行从事故当月起逐月累计；
     事故月之前为 None（不适用），封账月之后留空。
+
+    只把 ``close_month <= 所选已结月`` 的归档汇总读入内存字典（按组合聚合，
+    每组合一条），逐行逐列以 Python 整数累加；内存随涉及的组合数增长，而不随
+    单个组合的归档行数增长。
     """
-    rows = conn.execute(
-        "SELECT accident_month, payment_month, SUM(net_cents) AS s"
-        " FROM archive"
-        " WHERE close_month <= ? AND accident_month >= ? AND accident_month <= ?"
-        " GROUP BY accident_month, payment_month",
-        (close_month, start, close_month),
-    ).fetchall()
-    cells = {(r["accident_month"], r["payment_month"]): r["s"] for r in rows}
+    cells = _archived_cells(conn, start, close_month)
     latest = conn.execute("SELECT MAX(close_month) AS m FROM closes").fetchone()["m"]
     columns = month_range(start, latest)
     table = []
@@ -314,7 +360,7 @@ def build_triangle(conn, start, close_month):
                 out.append({"kind": "na"})
             elif col <= close_month:
                 cum += cells.get((acc, col), 0)
-                out.append({"kind": "val", "text": f"{cum:,}"})
+                out.append({"kind": "val", "text": format_cents(cum)})
             else:
                 out.append({"kind": "blank"})
         table.append({"accident": acc, "cells": out})

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """关键操作自测（不依赖 pytest）：设置待结月、CSV 校验、封账推进、同号覆盖、
-补报净变动归档、两期回查一致性、零额显示、失败原子性、导入/封账并发。
+补报净变动归档、两期回查一致性、零额显示、失败原子性、导入/封账并发，
+以及超出 int64 的大额合计、正负抵消回查、旧库迁移。
 
 运行：python3 tests/selftest.py
 """
@@ -14,6 +15,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import create_app  # noqa: E402
+from app.money import MAX_AMOUNT_CENTS  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_CSV = os.path.join(REPO, "demo", "claims_2026-01_base.csv")
@@ -54,6 +56,23 @@ def close_month(client, month):
 
 
 HEADER = "claim_no,accident_month,payment_month,amount_cents\n"
+BIG = MAX_AMOUNT_CENTS                    # 999,999,999,999,999 分
+INT64_MAX = 2 ** 63 - 1
+
+# 单笔 15 位、但整批合计要超过有符号 64 位，最少需要 9224 笔：
+# INT64_MAX / BIG ≈ 9223.4，取 9225 笔保证严格超出。
+OVERFLOW_ROWS = (INT64_MAX // BIG) + 2    # 9225 笔，合计 > 2^63-1
+
+
+def big_batch(prefix, count, amount=BIG, acc="2025-12", pay="2026-01"):
+    lines = [HEADER.rstrip("\n")]
+    for i in range(count):
+        lines.append(f"{prefix}{i},{acc},{pay},{amount}")
+    return "\n".join(lines) + "\n"
+
+
+def fmt(n):
+    return f"{n:,}"
 
 
 # ---------------------------------------------------------------- 1. 全流程 + 两期回查
@@ -86,7 +105,7 @@ def test_full_flow_two_periods():
 
     r = close_month(client, "2026-02")
     check("封 2026-02 成功", "已封账 2026-02" in r.get_data(as_text=True))
-    nets = dict(((a, p), n) for a, p, n in q(
+    nets = dict(((a, p), int(n)) for a, p, n in q(
         db, "SELECT accident_month, payment_month, net_cents FROM archive WHERE close_month='2026-02'"))
     expected = {
         ("2025-10", "2025-12"): 15000,    # C-0002 更正金额 80000 -> 95000
@@ -157,12 +176,12 @@ def test_overwrite_and_zero():
     close_month(client, "2026-01")
     rows = q(db, "SELECT accident_month, payment_month, net_cents FROM archive WHERE close_month='2026-01'")
     check("封前同期覆盖：只按最新值归档 (2026-01,2026-01)=35000",
-          rows == [("2026-01", "2026-01", 35000)], f"got {rows}")
+          [(a, p, int(n)) for a, p, n in rows] == [("2026-01", "2026-01", 35000)], f"got {rows}")
 
     # 下期更正 A1 支付月 2026-01 -> 2026-02；A3 正常补报
     import_text(client, HEADER + "A1,2026-01,2026-02,30000\nA3,2026-01,2026-02,4000\n")
     close_month(client, "2026-02")
-    nets = dict(((a, p), n) for a, p, n in q(
+    nets = dict(((a, p), int(n)) for a, p, n in q(
         db, "SELECT accident_month, payment_month, net_cents FROM archive WHERE close_month='2026-02'"))
     check("跨期更正支付月：旧组合 -30000，新组合 +34000",
           nets == {("2026-01", "2026-01"): -30000, ("2026-01", "2026-02"): 34000},
@@ -264,11 +283,180 @@ def test_concurrent_import_and_close():
           f"archived={total_archived} claims={total_claims}")
 
 
+# ---------------------------------------------------------------- 8. 大额合计超出 int64
+def test_overflow_batch_home_close_triangle():
+    print("\n[8] 批次合计 > int64：导入、首页、封账、归档、三角仍精确到分")
+    app, client, db = make_client()
+    setup_pending(client)
+    expected_total = BIG * OVERFLOW_ROWS
+    check("构造的批次合计确实超过有符号 64 位", expected_total > INT64_MAX,
+          f"total={expected_total}")
+
+    r = import_text(client, big_batch("B", OVERFLOW_ROWS))
+    body = r.get_data(as_text=True)
+    check("大额批次导入成功（此前会 OverflowError）", r.status_code == 200, f"status={r.status_code}")
+    check("导入结果页显示精确合计", fmt(expected_total) in body)
+    check("库内批次合计保存为精确十进制文本",
+          int(q(db, "SELECT total_cents FROM batches WHERE id=1")[0][0]) == expected_total)
+
+    home = client.get("/").get_data(as_text=True)
+    check("首页总额精确显示（不溢出、不丢分）", fmt(expected_total) in home)
+
+    r = close_month(client, "2026-01")
+    check("大额期间封账成功", "已封账 2026-01" in r.get_data(as_text=True))
+    arch = q(db, "SELECT net_cents FROM archive WHERE close_month='2026-01'")
+    check("归档净额精确等于批次合计",
+          [int(x[0]) for x in arch] == [expected_total], f"got {arch}")
+
+    a = client.get("/archive/2026-01").get_data(as_text=True)
+    check("归档明细合计精确显示", f"+{fmt(expected_total)}" in a)
+
+    t = client.get("/triangle?start=2025-10&close=2026-01").get_data(as_text=True)
+    check("三角累计精确显示", fmt(expected_total) in t)
+
+
+# ---------------------------------------------------------------- 9. 跨期正负抵消回查
+def test_cross_period_offset_triangle():
+    print("\n[9] 补报/更正正负抵消：三角回查给出抵消后的准确结果")
+    app, client, db = make_client()
+    setup_pending(client)
+    # 期 1：两个组合各一大笔
+    import_text(client, HEADER + f"O1,2025-11,2025-11,{BIG}\nO2,2025-12,2026-01,{BIG}\n")
+    close_month(client, "2026-01")
+
+    # 期 2：O1 全额冲回（同号改金额 0，移到同月），O2 部分更正，新增一大笔
+    import_text(client, HEADER + "O1,2025-11,2025-11,0\n"
+                                 f"O2,2025-12,2026-01,{BIG - 7}\n"
+                                 f"O3,2025-11,2026-02,{BIG}\n")
+    close_month(client, "2026-02")
+
+    # 期 3：O3 冲回，制造跨期正负抵消
+    import_text(client, HEADER + "O3,2025-11,2026-02,0\n")
+    close_month(client, "2026-03")
+
+    # 2026-03 期归档应只留非零净变动：O3 -BIG；O1/O2 无净变动
+    net3 = {tuple(r[:2]): int(r[2]) for r in q(
+        db, "SELECT accident_month, payment_month, net_cents FROM archive WHERE close_month='2026-03'")}
+    check("期 3 仅归档非零净变动（O1 完全抵消不归档）", net3 == {("2025-11", "2026-02"): -BIG},
+          f"got {net3}")
+
+    t3 = client.get("/triangle?start=2025-11&close=2026-03").get_data(as_text=True)
+    # 2025-11 行：2025-11 列 0；2026-02 列 +BIG 再 -BIG = 0；累计 0
+    check("抵消后 2025-11 事故行累计为 0", '<td class="num">0</td>' in t3)
+    check("O3 补报再冲回后无残留大额", fmt(BIG) not in t3,
+          "仍有未抵消的 BIG 累计")
+    # 2025-12 行应保留 BIG-7
+    check("部分更正后的 2025-12 行精确为 BIG-7", fmt(BIG - 7) in t3)
+    # 一期回查不受后续抵消影响
+    t1 = client.get("/triangle?start=2025-11&close=2026-01").get_data(as_text=True)
+    check("一期回查仍为当时口径（含两笔 BIG 各自累计）",
+          t1.count(f'<td class="num">{fmt(BIG)}</td>') >= 2, "一期累计缺失")
+
+
+# ---------------------------------------------------------------- 10. 失败原子性（大额封账/导入）
+def test_overflow_failure_atomicity():
+    print("\n[10] 大额失败原子性：导入/封账失败保留操作前数据与待结月")
+    app, client, db = make_client()
+    setup_pending(client)
+    import_text(client, HEADER + f"F1,2025-12,2026-01,{BIG}\n")
+    close_month(client, "2026-01")
+    pending_before = q(db, "SELECT value FROM meta WHERE key='pending_month'")[0][0]
+    claims_before = q(db, "SELECT claim_no, amount_cents FROM claims ORDER BY claim_no")
+    archive_before = q(db, "SELECT close_month, accident_month, payment_month, net_cents "
+                           "FROM archive ORDER BY close_month, accident_month, payment_month")
+
+    # 导入：含一超限行（16 位）整批拒绝
+    bad = HEADER + f"F2,2025-12,2026-02,{BIG}\nF3,2025-12,2026-02,{'9' * 16}\n"
+    r = import_text(client, bad)
+    check("超 15 位金额整批拒绝", r.status_code == 400, f"status={r.status_code}")
+    check("拒绝后 claims 不变（无部分结果）",
+          q(db, "SELECT claim_no, amount_cents FROM claims ORDER BY claim_no") == claims_before)
+    check("拒绝后待结月不变",
+          q(db, "SELECT value FROM meta WHERE key='pending_month'")[0][0] == pending_before)
+
+    # 封账：封非待结月被拒绝，数据与待结月不变
+    r = close_month(client, "2026-01")
+    check("拒绝封非待结月", "只能封当前待结月" in r.get_data(as_text=True))
+    check("拒绝后 archive 不变",
+          q(db, "SELECT close_month, accident_month, payment_month, net_cents "
+                "FROM archive ORDER BY close_month, accident_month, payment_month") == archive_before)
+    check("拒绝后待结月仍为 2026-02",
+          q(db, "SELECT value FROM meta WHERE key='pending_month'")[0][0] == "2026-02")
+
+    # 成功封账后再把待结月推进；总额仍精确
+    import_text(client, HEADER + f"F4,2025-12,2026-02,{BIG}\n")
+    close_month(client, "2026-02")
+    total = sum(int(r[0]) for r in q(db, "SELECT net_cents FROM archive"))
+    check("两期归档净额合计精确等于两笔 BIG", total == 2 * BIG, f"got {total}")
+
+
+# ---------------------------------------------------------------- 11. 旧 INTEGER 库迁移
+OLD_SCHEMA = """
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, period_month TEXT NOT NULL,
+  row_count INTEGER NOT NULL, total_cents INTEGER NOT NULL,
+  overwritten INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT '2026-01-01 00:00:00');
+CREATE TABLE claims (
+  claim_no TEXT PRIMARY KEY, accident_month TEXT NOT NULL, payment_month TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL CHECK (amount_cents >= 0),
+  batch_id INTEGER NOT NULL REFERENCES batches(id));
+CREATE TABLE claim_archived (
+  claim_no TEXT PRIMARY KEY, accident_month TEXT NOT NULL, payment_month TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL);
+CREATE TABLE closes (
+  close_month TEXT PRIMARY KEY, batch_count INTEGER NOT NULL,
+  combo_count INTEGER NOT NULL, closed_at TEXT NOT NULL DEFAULT '2026-01-01 00:00:00');
+CREATE TABLE archive (
+  close_month TEXT NOT NULL, accident_month TEXT NOT NULL, payment_month TEXT NOT NULL,
+  net_cents INTEGER NOT NULL,
+  PRIMARY KEY (close_month, accident_month, payment_month));
+"""
+
+
+def test_legacy_db_migration():
+    print("\n[11] 旧库（INTEGER 金额）可直接续用并支持大额")
+    tmp = tempfile.mkdtemp(prefix="lt-legacy-")
+    db = os.path.join(tmp, "old.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(OLD_SCHEMA)
+    conn.execute("INSERT INTO meta VALUES('pending_month','2026-02')")
+    conn.execute("INSERT INTO batches(id,period_month,row_count,total_cents) VALUES(1,'2026-01',1,80000)")
+    conn.execute("INSERT INTO claims VALUES('C-0002','2025-10','2025-12',80000,1)")
+    conn.execute("INSERT INTO claim_archived VALUES('C-0002','2025-10','2025-12',80000)")
+    conn.execute("INSERT INTO archive VALUES('2026-01','2025-10','2025-12',80000)")
+    conn.execute("INSERT INTO closes VALUES('2026-01',1,1,'2026-01-01 00:00:00')")
+    conn.commit()
+    conn.close()
+
+    app = create_app({"DB_PATH": db, "TESTING": True})
+    client = app.test_client()
+    home = client.get("/").get_data(as_text=True)
+    check("旧库启动不报错，历史数据可读", "80,000" in home, home[:200])
+
+    # 旧库续用：追加一大额批次并使合计（含历史）超 int64
+    import_text(client, big_batch("N", OVERFLOW_ROWS, acc="2025-10", pay="2026-01"))
+    close_month(client, "2026-02")
+    rows = q(db, "SELECT accident_month, payment_month, net_cents FROM archive WHERE close_month='2026-02'")
+    expected = {("2025-10", "2026-01"): BIG * OVERFLOW_ROWS}
+    check("旧库续用：本期净变动精确",
+          {tuple(r[:2]): int(r[2]) for r in rows} == expected, f"got {rows}")
+
+    t = client.get("/triangle?start=2025-10&close=2026-02").get_data(as_text=True)
+    check("旧库+新数据三角累计超 int64 仍精确",
+          fmt(BIG * OVERFLOW_ROWS + 80000) in t and "80,000" in t)
+
+
 def main():
     for fn in (test_full_flow_two_periods, test_import_validation,
                test_overwrite_and_zero, test_close_constraints,
                test_batch_atomicity, test_setup_locked_after_data,
-               test_concurrent_import_and_close):
+               test_concurrent_import_and_close,
+               test_overflow_batch_home_close_triangle,
+               test_cross_period_offset_triangle,
+               test_overflow_failure_atomicity,
+               test_legacy_db_migration):
         fn()
     print(f"\n==== 结果：{len(_passed)} 通过，{len(_failed)} 失败 ====")
     if _failed:

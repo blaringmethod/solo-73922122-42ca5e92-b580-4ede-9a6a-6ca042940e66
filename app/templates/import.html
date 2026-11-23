@@ -37,7 +37,7 @@
     <tr><th>批次号</th><td>#{{ result.batch_id }}</td></tr>
     <tr><th>计入期间</th><td>{{ result.period_month }}</td></tr>
     <tr><th>笔数</th><td class="num">{{ result.row_count }}</td></tr>
-    <tr><th>金额合计(分)</th><td class="num">{{ '{:,}'.format(result.total_cents) }}</td></tr>
+    <tr><th>金额合计(分)</th><td class="num">{{ total_text }}</td></tr>
     <tr><th>覆盖重报笔数</th><td class="num">{{ result.overwritten }}</td></tr>
   </table>
 </section>

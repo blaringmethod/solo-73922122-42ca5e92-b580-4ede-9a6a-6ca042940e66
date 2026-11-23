@@ -1,9 +1,12 @@
 """页面路由：首页 / 设置待结月 / 导入赔款 / 封账 / 三角回查 / 归档明细。"""
+import sqlite3
+
 from flask import (Blueprint, abort, flash, redirect, render_template,
                    request, url_for)
 
 from . import logic
 from .db import get_db
+from .money import format_cents, to_int
 from .months import month_range, parse_month
 
 bp = Blueprint("main", __name__)
@@ -15,11 +18,15 @@ def index():
     pending = logic.get_pending(conn)
     closes = conn.execute(
         "SELECT * FROM closes ORDER BY close_month DESC").fetchall()
-    batches = conn.execute(
+    batch_rows = conn.execute(
         "SELECT * FROM batches ORDER BY id DESC LIMIT 10").fetchall()
-    stat = conn.execute(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(amount_cents), 0) AS s FROM claims"
-    ).fetchone()
+    # 金额列以文本保存，取出后在 Python 整数上格式化，避免大额合计丢精度。
+    batches = [{"id": b["id"], "period_month": b["period_month"],
+                "row_count": b["row_count"], "total_cents": to_int(b["total_cents"]),
+                "overwritten": b["overwritten"], "created_at": b["created_at"]}
+               for b in batch_rows]
+    summary = logic.claims_summary(conn)
+    stat = {"n": summary["n"], "s": summary["cents"]}
     return render_template("index.html", pending=pending, closes=closes,
                            batches=batches, stat=stat)
 
@@ -70,10 +77,14 @@ def import_csv():
         except logic.BatchError as exc:
             return render_template("import.html", pending=logic.get_pending(conn),
                                    errors=exc.errors, result=None), 409
+        except sqlite3.Error as exc:
+            return render_template("import.html", pending=logic.get_pending(conn),
+                                   errors=[f"写入失败，整批已回滚：{exc}"], result=None), 500
         flash(f"批次 #{result['batch_id']} 导入成功：{result['row_count']} 笔，"
               f"计入 {result['period_month']} 期（其中覆盖重报 {result['overwritten']} 笔）", "ok")
         return render_template("import.html", pending=logic.get_pending(conn),
-                               errors=None, result=result)
+                               errors=None, result=result,
+                               total_text=format_cents(result["total_cents"]))
     return render_template("import.html", pending=pending, errors=None, result=None)
 
 
@@ -94,6 +105,9 @@ def close():
                 result = logic.close_pending(conn, month)
         except logic.CloseError as exc:
             flash(str(exc), "error")
+            return redirect(url_for("main.close"))
+        except sqlite3.Error as exc:
+            flash(f"封账失败，已回滚到操作前状态（待结月仍为 {logic.get_pending(conn)}）：{exc}", "error")
             return redirect(url_for("main.close"))
         flash(f"已封账 {result['closed']}：本期 {result['batch_count']} 批、"
               f"{result['claim_count']} 笔变动，归档 {result['combo_count']} 个组合；"
@@ -129,6 +143,6 @@ def archive(close_month):
     if close_month not in logic.closed_months(conn):
         abort(404)
     rows = logic.archive_detail(conn, close_month)
-    total = sum(r["net_cents"] for r in rows)
+    total = logic.archive_net_total(conn, close_month)
     return render_template("archive.html", close_month=close_month,
                            rows=rows, total=total)
